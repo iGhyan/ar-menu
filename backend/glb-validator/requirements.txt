@@ -1,0 +1,3 @@
+# glb-validator-lambda requirements
+# boto3 is provided by the Lambda runtime — listed here for local testing only
+boto3>=1.34.0

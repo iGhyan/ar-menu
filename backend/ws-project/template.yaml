@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: WebSocket API with 3 Lambda functions - Connect, Disconnect, Message
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+      - x86_64
+    Layers:
+      - !Ref DependenciesLayer
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+
+  # ── DynamoDB Tables ────────────────────
+  ConnectionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ConnectionTable-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub OrderTable-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+        - AttributeName: orderId
+          KeyType: RANGE
+
+  # ── SQS Dead Letter Queue ──────────────
+  OrderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub order-dlq-${Stage}
+      MessageRetentionPeriod: 1209600
+
+  # ── Lambda Layer ───────────────────────
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub ws-dependencies-${Stage}
+      Description: redis, PyJWT, boto3
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.13
+    Metadata:
+      BuildMethod: python3.13
+
+  # ── IAM Role ───────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ws-lambda-role-${Stage}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt ConnectionTable.Arn
+                  - !GetAtt OrderTable.Arn
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt OrderDLQ.Arn
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:SendTaskSuccess
+                  - states:SendTaskFailure
+                Resource: '*'
+
+  # ── Step Functions ─────────────────────
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ws-message-lambda-${Stage}
+
+  OrderStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: StepFunctionsRole
+    Properties:
+      StateMachineName: !Sub order-state-machine-${Stage}
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      Definition:
+        Comment: Order processing workflow
+        StartAt: WaitForWebSocket
+        States:
+          WaitForWebSocket:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
+            Parameters:
+              FunctionName: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ws-message-lambda-${Stage}
+              Payload:
+                taskToken.$: $$.Task.Token
+                input.$: $
+            TimeoutSeconds: 300
+            Next: ProcessOrder
+          ProcessOrder:
+            Type: Pass
+            End: true
+
+  # ════════════════════════════════════════
+  # LAMBDA 1 — ws-connect
+  # ════════════════════════════════════════
+  WsConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ws-connect-lambda-${Stage}
+      CodeUri: functions/ws_connect/
+      Handler: handler.lambda_handler
+      MemorySize: 256
+      Timeout: 5
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          REDIS_URL: redis://localhost:6379
+          TABLE_CONN: !Ref ConnectionTable
+          JWT_SECRET: test-secret
+
+  WsConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsConnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*
+
+  # ════════════════════════════════════════
+  # LAMBDA 2 — ws-disconnect
+  # ════════════════════════════════════════
+  WsDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ws-disconnect-lambda-${Stage}
+      CodeUri: functions/ws_disconnect/
+      Handler: handler.lambda_handler
+      MemorySize: 256
+      Timeout: 5
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          REDIS_URL: redis://localhost:6379
+
+  WsDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsDisconnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*
+
+  # ════════════════════════════════════════
+  # LAMBDA 3 — ws-message
+  # ════════════════════════════════════════
+  WsMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ws-message-lambda-${Stage}
+      CodeUri: functions/ws_message/
+      Handler: handler.lambda_handler
+      MemorySize: 512
+      Timeout: 10
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TABLE_ORDER: !Ref OrderTable
+          DLQ_URL: !Ref OrderDLQ
+          STEP_ARN: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:order-state-machine-${Stage}
+
+  WsMessagePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsMessageFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*
+
+  # ════════════════════════════════════════
+  # API GATEWAY WEBSOCKET
+  # ════════════════════════════════════════
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ws-api-${Stage}
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    DependsOn: ConnectIntegration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub integrations/${ConnectIntegration}
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsDisconnectFunction.Arn}/invocations
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    DependsOn: DisconnectIntegration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub integrations/${DisconnectIntegration}
+
+  DefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsMessageFunction.Arn}/invocations
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    DependsOn: DefaultIntegration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      AuthorizationType: NONE
+      Target: !Sub integrations/${DefaultIntegration}
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - DefaultRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: !Ref Stage
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+Outputs:
+  WebSocketURL:
+    Description: WebSocket connection URL
+    Value: !Sub wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  ConnectionTableName:
+    Value: !Ref ConnectionTable
+  OrderTableName:
+    Value: !Ref OrderTable
+  DLQUrl:
+    Value: !Ref OrderDLQ
+  StateMachineArn:
+    Value: !Ref OrderStateMachine

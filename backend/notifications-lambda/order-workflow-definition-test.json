@@ -1,0 +1,254 @@
+{
+  "Comment": "Order lifecycle - Lambda handles state updates, SQS sends notifications",
+  "StartAt": "MarkReceived",
+  "States": {
+
+    "MarkReceived": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:833090513377:function:orders-lambda-prod",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "RECEIVED",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "ResultPath": null,
+      "Next": "NotifyReceived",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "IntervalSeconds": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "NotifyReceived": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/833090513377/notifications-queue-dev",
+        "MessageBody": {
+          "orderId.$": "$.orderId",
+          "tenantId.$": "$.tenantId",
+          "status": "RECEIVED",
+          "message": "Your order has been received."
+        }
+      },
+      "ResultPath": null,
+      "Next": "WaitForKitchen",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "WaitForKitchen", "ResultPath": null }]
+    },
+
+    "WaitForKitchen": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "CheckKitchen"
+    },
+
+    "CheckKitchen": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.kitchenAccepted", "BooleanEquals": true, "Next": "MarkPreparing" },
+        { "Variable": "$.cancelled",       "BooleanEquals": true, "Next": "MarkCancelled" }
+      ],
+      "Default": "MarkTimedOut"
+    },
+
+    "MarkPreparing": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:833090513377:function:orders-lambda-prod",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "PREPARING",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "ResultPath": null,
+      "Next": "NotifyPreparing",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "IntervalSeconds": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "NotifyPreparing": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/833090513377/notifications-queue-dev",
+        "MessageBody": {
+          "orderId.$": "$.orderId",
+          "tenantId.$": "$.tenantId",
+          "status": "PREPARING",
+          "message": "Your order is being prepared."
+        }
+      },
+      "ResultPath": null,
+      "Next": "WaitForFood",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "WaitForFood", "ResultPath": null }]
+    },
+
+    "WaitForFood": {
+      "Type": "Wait",
+      "Seconds": 1800,
+      "Next": "CheckFood"
+    },
+
+    "CheckFood": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.foodReady", "BooleanEquals": true, "Next": "MarkReady"     },
+        { "Variable": "$.cancelled", "BooleanEquals": true, "Next": "MarkCancelled" }
+      ],
+      "Default": "MarkTimedOut"
+    },
+
+    "MarkReady": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:833090513377:function:orders-lambda-prod",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "READY",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "ResultPath": null,
+      "Next": "NotifyReady",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "IntervalSeconds": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "NotifyReady": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/833090513377/notifications-queue-dev",
+        "MessageBody": {
+          "orderId.$": "$.orderId",
+          "tenantId.$": "$.tenantId",
+          "status": "READY",
+          "message": "Your order is ready for pickup!"
+        }
+      },
+      "ResultPath": null,
+      "Next": "WaitForDelivery",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "WaitForDelivery", "ResultPath": null }]
+    },
+
+    "WaitForDelivery": {
+      "Type": "Wait",
+      "Seconds": 900,
+      "Next": "CheckDelivery"
+    },
+
+    "CheckDelivery": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.delivered", "BooleanEquals": true, "Next": "MarkDelivered" },
+        { "Variable": "$.cancelled", "BooleanEquals": true, "Next": "MarkCancelled" }
+      ],
+      "Default": "MarkTimedOut"
+    },
+
+    "MarkDelivered": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:833090513377:function:orders-lambda-prod",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "DELIVERED",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "ResultPath": null,
+      "Next": "NotifyDelivered",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "IntervalSeconds": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "NotifyDelivered": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/833090513377/notifications-queue-dev",
+        "MessageBody": {
+          "orderId.$": "$.orderId",
+          "tenantId.$": "$.tenantId",
+          "status": "DELIVERED",
+          "message": "Your order has been delivered. Enjoy!"
+        }
+      },
+      "ResultPath": null,
+      "Next": "OrderSuccess",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderSuccess", "ResultPath": null }]
+    },
+
+    "MarkCancelled": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:833090513377:function:orders-lambda-prod",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "CANCELLED",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "ResultPath": null,
+      "Next": "NotifyCancelled",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "IntervalSeconds": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "NotifyCancelled": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/833090513377/notifications-queue-dev",
+        "MessageBody": {
+          "orderId.$": "$.orderId",
+          "tenantId.$": "$.tenantId",
+          "status": "CANCELLED",
+          "message": "Your order has been cancelled."
+        }
+      },
+      "ResultPath": null,
+      "Next": "OrderCancelled",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderCancelled", "ResultPath": null }]
+    },
+
+    "MarkTimedOut": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:833090513377:function:orders-lambda-prod",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "TIMED_OUT",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "ResultPath": null,
+      "Next": "OrderTimedOut",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "OrderSuccess":   { "Type": "Succeed" },
+    "OrderCancelled": { "Type": "Fail", "Error": "Cancelled", "Cause": "Order cancelled by user" },
+    "OrderTimedOut":  { "Type": "Fail", "Error": "TimedOut",  "Cause": "Order timed out" },
+    "OrderFailed":    { "Type": "Fail", "Error": "Failed",    "Cause": "Unexpected error" }
+  }
+}

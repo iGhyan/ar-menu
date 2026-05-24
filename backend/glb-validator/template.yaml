@@ -1,0 +1,68 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: glb-validator-lambda – validates .glb assets uploaded to S3
+
+Globals:
+  Function:
+    Runtime: python3.13
+    MemorySize: 1024
+    Timeout: 60
+    Environment:
+      Variables:
+        BUCKET_AR: !Ref BucketAR
+        SNS_ADMIN: !Ref SNSAdminArn
+
+Parameters:
+  BucketAR:
+    Type: String
+    Default: menu-assets-dev-833090513377
+    Description: Name of the existing S3 bucket that holds AR assets
+
+  SNSAdminArn:
+    Type: String
+    Description: ARN of the SNS topic used to notify admins of rejected assets
+
+Resources:
+
+  # Lambda Function
+  GlbValidatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: glb-validator-lambda
+      CodeUri: ./
+      Handler: lambda_function.lambda_handler
+      Description: Validates .glb files uploaded to S3 and routes them to approved/ or rejected/
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource:
+                - !Sub "arn:aws:s3:::${BucketAR}"
+                - !Sub "arn:aws:s3:::${BucketAR}/*"
+
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref SNSAdminArn
+
+  # Lambda permission for S3 to invoke it
+  GlbValidatorS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GlbValidatorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${BucketAR}"
+
+Outputs:
+  GlbValidatorFunctionArn:
+    Description: ARN of the glb-validator-lambda
+    Value: !GetAtt GlbValidatorFunction.Arn
+
+  ARBucketName:
+    Description: S3 bucket used for AR assets
+    Value: !Ref BucketAR

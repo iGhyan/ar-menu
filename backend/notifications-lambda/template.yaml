@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: notifications-lambda — SQS-triggered Lambda for SNS + WebSocket + Pinpoint
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  SnsTopicArn:
+    Type: String
+    Default: "arn:aws:sns:us-east-1:833090513377:orders-notifications-dev"
+
+  WsEndpoint:
+    Type: String
+    Default: "https://6zvolh5t5b.execute-api.us-east-1.amazonaws.com/prod"
+
+  WsConnectionsTableName:
+    Type: String
+    Default: "ConnectionTable-dev"
+
+  OrderTableName:
+    Type: String
+    Default: "OrderTable"
+
+  PinpointAppId:
+    Type: String
+    Default: ""
+
+  PinpointFromNumber:
+    Type: String
+    Default: ""
+
+
+# ── Globals ───────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime:       python3.14
+    Architectures: [arm64]
+    Handler:       handler.lambda_handler
+    Timeout:       60
+    MemorySize:    256
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Dead Letter Queue ───────────────────────────────────────────────────────
+  NotificationsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub notifications-dlq-${Stage}
+      MessageRetentionPeriod: 1209600   # 14 days
+      Tags:
+        - Key: Stage
+          Value: !Ref Stage
+
+  # ── Main SQS Queue ──────────────────────────────────────────────────────────
+  NotificationsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub notifications-queue-${Stage}
+      VisibilityTimeout: 70             # must be > Lambda timeout (60s)
+      MessageRetentionPeriod: 86400     # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationsDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Stage
+          Value: !Ref Stage
+
+  # ── Lambda Function ─────────────────────────────────────────────────────────
+  NotificationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub notifications-lambda-${Stage}
+      CodeUri: ./
+
+      Environment:
+        Variables:
+          SNS_TOPIC:              !Ref SnsTopicArn
+          WS_ENDPOINT:            !Ref WsEndpoint
+          WS_CONNECTIONS_TABLE:   !Ref WsConnectionsTableName
+          TABLE_ORDER:            !Ref OrderTableName
+          PINPOINT_APP_ID:        !Ref PinpointAppId
+          PINPOINT_FROM_NUMBER:   !Ref PinpointFromNumber
+
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue:    !GetAtt NotificationsQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+      Policies:
+        # SNS publish
+        - SNSPublishMessagePolicy:
+            TopicName: !Select [5, !Split [":", !Ref SnsTopicArn]]
+
+        # DynamoDB — OrderTable read
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrderTableName
+
+        # DynamoDB — ConnectionTable scan + delete (stale connections)
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+                - dynamodb:DeleteItem
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${WsConnectionsTableName}"
+
+        # SQS consume
+        - SQSPollerPolicy:
+            QueueName: !GetAtt NotificationsQueue.QueueName
+
+        # API GW WebSocket management
+        - Statement:
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource: "arn:aws:execute-api:us-east-1:833090513377:6zvolh5t5b/*/@connections/*"
+
+        # Pinpoint (only active if PINPOINT_APP_ID is set)
+        - Statement:
+            - Effect: Allow
+              Action:
+                - mobiletargeting:SendMessages
+              Resource: "*"
+
+      Tags:
+        Stage: !Ref Stage
+
+  # ── DLQ CloudWatch Alarm ────────────────────────────────────────────────────
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub notifications-dlq-not-empty-${Stage}
+      AlarmDescription: Messages in DLQ — SNS publish failed after 3 retries
+      Namespace:          AWS/SQS
+      MetricName:         ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name:  QueueName
+          Value: !GetAtt NotificationsDLQ.QueueName
+      Statistic:          Sum
+      Period:             60
+      EvaluationPeriods:  1
+      Threshold:          1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData:   notBreaching
+
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  NotificationsQueueUrl:
+    Description: Pass this to orders-lambda as NOTIFICATIONS_QUEUE_URL
+    Value: !Ref NotificationsQueue
+    Export:
+      Name: !Sub notifications-queue-url-${Stage}
+
+  NotificationsQueueArn:
+    Value: !GetAtt NotificationsQueue.Arn
+    Export:
+      Name: !Sub notifications-queue-arn-${Stage}
+
+  NotificationsDLQUrl:
+    Value: !Ref NotificationsDLQ
+
+  NotificationsFunctionArn:
+    Value: !GetAtt NotificationsFunction.Arn

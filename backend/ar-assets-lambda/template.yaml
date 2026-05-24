@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  BucketAr:
+    Type: String
+  CfDomain:
+    Type: String
+  TableMenu:
+    Type: String
+
+Globals:
+  Function:
+    Runtime: python3.14
+    MemorySize: 512
+    Timeout: 10
+  Api:
+    Cors:
+      AllowMethods: "'GET,PUT,DELETE,OPTIONS'"
+      AllowHeaders: "'Content-Type,X-Tenant-Id,Authorization'"
+      AllowOrigin: "'*'"
+
+Resources:
+  ArAssetsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ar-assets-lambda
+      Handler: handler.lambda_handler
+      CodeUri: .
+      Environment:
+        Variables:
+          BUCKET_AR: !Ref BucketAr
+          CF_DOMAIN:  !Ref CfDomain
+          TABLE_MENU: !Ref TableMenu
+      Policies:
+        - !Ref ArAssetsPolicy
+      Events:
+        GetAr:
+          Type: Api
+          Properties:
+            Path: /ar/{restaurantId}/{itemId}
+            Method: GET
+        PutAr:
+          Type: Api
+          Properties:
+            Path: /ar/{restaurantId}/{itemId}
+            Method: PUT
+        DeleteAr:
+          Type: Api
+          Properties:
+            Path: /ar/{restaurantId}/{itemId}
+            Method: DELETE
+        OptionsAr:
+          Type: Api
+          Properties:
+            Path: /ar/{restaurantId}/{itemId}
+            Method: OPTIONS
+
+  ArAssetsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: S3PresignedGet
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${BucketAr}/*"
+
+          - Sid: CloudFrontInvalidate
+            Effect: Allow
+            Action:
+              - cloudfront:CreateInvalidation
+              - cloudfront:ListDistributions
+            Resource: "*"
+
+          - Sid: DynamoMenuTable
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:UpdateItem
+            Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableMenu}"
+
+Outputs:
+  ArAssetsApiUrl:
+    Description: AR Assets API base URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/ar/{restaurantId}/{itemId}"
+  ArAssetsFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt ArAssetsFunction.Arn

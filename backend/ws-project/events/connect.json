@@ -1,0 +1,10 @@
+{
+  "requestContext": {
+    "routeKey": "$connect",
+    "connectionId": "local-test-conn-001",
+    "eventType": "CONNECT"
+  },
+  "headers": {
+    "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEyMyIsImlhdCI6MTcwMDAwMDAwMH0.REPLACE_WITH_REAL_TOKEN"
+  }
+}

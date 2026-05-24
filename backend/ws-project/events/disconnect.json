@@ -1,0 +1,8 @@
+{
+  "requestContext": {
+    "routeKey": "$disconnect",
+    "connectionId": "local-test-conn-001",
+    "eventType": "DISCONNECT"
+  },
+  "headers": {}
+}

@@ -1,0 +1,163 @@
+{
+  "Comment": "Order lifecycle — single Lambda handles all state updates",
+  "StartAt": "MarkReceived",
+  "States": {
+
+    "MarkReceived": {
+      "Type": "Task",
+      "Resource": "${OrdersFunctionArn}",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "RECEIVED",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "Next": "WaitForKitchen",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "IntervalSeconds": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "WaitForKitchen": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "CheckKitchen"
+    },
+
+    "CheckKitchen": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.kitchenAccepted", "BooleanEquals": true,  "Next": "MarkPreparing" },
+        { "Variable": "$.cancelled",       "BooleanEquals": true,  "Next": "MarkCancelled" }
+      ],
+      "Default": "MarkTimedOut"
+    },
+
+    "MarkPreparing": {
+      "Type": "Task",
+      "Resource": "${OrdersFunctionArn}",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "PREPARING",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "Next": "WaitForFood",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "IntervalSeconds": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "WaitForFood": {
+      "Type": "Wait",
+      "Seconds": 1800,
+      "Next": "CheckFood"
+    },
+
+    "CheckFood": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.foodReady", "BooleanEquals": true, "Next": "MarkReady"     },
+        { "Variable": "$.cancelled", "BooleanEquals": true, "Next": "MarkCancelled" }
+      ],
+      "Default": "MarkTimedOut"
+    },
+
+    "MarkReady": {
+      "Type": "Task",
+      "Resource": "${OrdersFunctionArn}",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "READY",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "Next": "WaitForDelivery",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "IntervalSeconds": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "WaitForDelivery": {
+      "Type": "Wait",
+      "Seconds": 900,
+      "Next": "CheckDelivery"
+    },
+
+    "CheckDelivery": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.delivered", "BooleanEquals": true, "Next": "MarkDelivered" },
+        { "Variable": "$.cancelled", "BooleanEquals": true, "Next": "MarkCancelled" }
+      ],
+      "Default": "MarkTimedOut"
+    },
+
+    "MarkDelivered": {
+      "Type": "Task",
+      "Resource": "${OrdersFunctionArn}",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "DELIVERED",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "Next": "OrderSuccess",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "IntervalSeconds": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "MarkCancelled": {
+      "Type": "Task",
+      "Resource": "${OrdersFunctionArn}",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "CANCELLED",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "Next": "OrderCancelled",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "IntervalSeconds": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "MarkTimedOut": {
+      "Type": "Task",
+      "Resource": "${OrdersFunctionArn}",
+      "Parameters": {
+        "source": "stepfunctions",
+        "orderId.$": "$.orderId",
+        "tenantId.$": "$.tenantId",
+        "status": "TIMED_OUT",
+        "kitchenAccepted.$": "$.kitchenAccepted",
+        "foodReady.$": "$.foodReady",
+        "delivered.$": "$.delivered",
+        "cancelled.$": "$.cancelled"
+      },
+      "Next": "OrderTimedOut",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "OrderFailed", "ResultPath": "$.error" }]
+    },
+
+    "OrderSuccess":  { "Type": "Succeed" },
+    "OrderCancelled":{ "Type": "Fail", "Error": "Cancelled", "Cause": "Order cancelled by user" },
+    "OrderTimedOut": { "Type": "Fail", "Error": "TimedOut",  "Cause": "Order timed out" },
+    "OrderFailed":   { "Type": "Fail", "Error": "Failed",    "Cause": "Unexpected error" }
+  }
+}
