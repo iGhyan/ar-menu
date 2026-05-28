@@ -16,7 +16,7 @@ Parameters:
 
   WsEndpoint:
     Type: String
-    Default: "https://6zvolh5t5b.execute-api.us-east-1.amazonaws.com/prod"
+    Default: "https://6zvolh5t5b.execute-api.us-east-1.amazonaws.com/dev"
 
   WsConnectionsTableName:
     Type: String
@@ -38,7 +38,7 @@ Parameters:
 # ── Globals ───────────────────────────────────────────────────────────────────
 Globals:
   Function:
-    Runtime:       python3.14
+    Runtime:       python3.13
     Architectures: [arm64]
     Handler:       handler.lambda_handler
     Timeout:       60
@@ -126,7 +126,7 @@ Resources:
             - Effect: Allow
               Action:
                 - execute-api:ManageConnections
-              Resource: "arn:aws:execute-api:us-east-1:833090513377:6zvolh5t5b/*/@connections/*"
+              Resource: "arn:aws:execute-api:us-east-1:833090513377:6zvolh5t5b/dev/@connections/*"
 
         # Pinpoint (only active if PINPOINT_APP_ID is set)
         - Statement:

@@ -1,8 +1,0 @@
-{
-  "requestContext": {
-    "routeKey": "$default",
-    "connectionId": "local-test-conn-001",
-    "eventType": "MESSAGE"
-  },
-  "body": "{\"status\": \"confirmed\", \"orderId\": \"ord-001\", \"taskToken\": \"\"}"
-}

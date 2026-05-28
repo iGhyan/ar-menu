@@ -1,37 +1,88 @@
 """
+functions/ws_disconnect/handler.py
+====================================
 ws-disconnect-lambda
 Trigger  : API Gateway WebSocket $disconnect
-Memory   : 256 MB  |  Timeout : 5s
-Env Vars : REDIS_URL
+Memory   : 256 MB  |  Timeout: 5s
+
+Flow
+----
+1. Remove connectionId from Redis hash (best-effort, non-critical)
+2. Remove connection record from DynamoDB (best-effort)
+3. Always return 200 — disconnect must always succeed
+
+Env vars
+--------
+  REDIS_URL   — Redis connection URL (required)
+  TABLE_CONN  — DynamoDB connection table name (required)
 """
 
+from __future__ import annotations
+
 import os
-import logging
-import redis
+import sys
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+sys.path.insert(0, "/opt/python")
 
-# ── Cold-start initialisation ──
-REDIS_URL    = os.environ["REDIS_URL"]
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
+from shared.aws_clients import get_dynamodb_resource
+from shared.structured_logger import get_logger, bind_lambda_context
 
+_TABLE_CONN = os.environ["REDIS_URL"]   # kept for Redis
+_REDIS_URL  = os.environ["REDIS_URL"]
+_TABLE_CONN = os.environ.get("TABLE_CONN", "")
+
+_log   = get_logger("ws-disconnect")
+
+# ── Redis (module-level — reused on warm starts) ──────────────────────────────
+try:
+    import redis as _redis_lib
+    _redis_client = _redis_lib.Redis.from_url(
+        _REDIS_URL, decode_responses=True, socket_timeout=2
+    )
+    _redis_client.ping()
+    _REDIS_OK = True
+except Exception as exc:
+    _log.warning("redis.unavailable", cause=str(exc))
+    _redis_client = None
+    _REDIS_OK     = False
+
+# ── DynamoDB (optional — only if TABLE_CONN configured) ───────────────────────
+_table = get_dynamodb_resource().Table(_TABLE_CONN) if _TABLE_CONN else None
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def lambda_handler(event: dict, context) -> dict:
-    request_ctx   = event.get("requestContext", {})
-    connection_id = request_ctx.get("connectionId", "")
+    bind_lambda_context(context)
 
-    # ── Redis DEL — non-critical ────────────────────────────
-    # Agar Redis fail ho to sirf log karo, disconnect complete hoga
-    try:
-        deleted = redis_client.hdel("connections", connection_id)
-        if deleted:
-            logger.info("Redis: removed connectionId=%s", connection_id)
-        else:
-            logger.info("Redis: connectionId=%s was not in hash (already gone)", connection_id)
-    except redis.RedisError as e:
-        # Non-critical — log karke continue karo
-        logger.error("Redis DEL failed for %s (non-critical): %s", connection_id, e)
+    connection_id = (event.get("requestContext") or {}).get("connectionId", "")
 
-    logger.info("Disconnected: connectionId=%s", connection_id)
+    # ── 1. Remove from Redis (non-critical) ───────────────────────────────────
+    if _REDIS_OK and _redis_client:
+        try:
+            deleted = _redis_client.hdel("connections", connection_id)
+            if deleted:
+                _log.info("redis.connection.removed", connection_id=connection_id)
+            else:
+                _log.info("redis.connection.already_gone", connection_id=connection_id)
+        except Exception as exc:  # noqa: BLE001
+            _log.error(
+                "redis.hdel.failed",
+                connection_id=connection_id,
+                exc_message=str(exc),
+            )
+
+    # ── 2. Remove from DynamoDB (non-critical) ────────────────────────────────
+    if _table and connection_id:
+        try:
+            _table.delete_item(Key={"connectionId": connection_id})
+            _log.info("ddb.connection.removed", connection_id=connection_id)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "ddb.connection.remove.failed",
+                connection_id=connection_id,
+                exc_message=str(exc),
+            )
+
+    _log.info("ws.disconnected", connection_id=connection_id)
     return {"statusCode": 200, "body": "Disconnected"}

@@ -4,6 +4,7 @@ version = 0.1
 
 [default.global.parameters]
 stack_name = "notifications-lambda"
+region = "us-east-1"
 
 [default.build.parameters]
 cached = true
@@ -16,6 +17,11 @@ lint = true
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true
+s3_prefix = "notifications-lambda-dev"
+disable_rollback = true
+parameter_overrides = "Stage=\"dev\" SnsTopicArn=\"arn:aws:sns:us-east-1:833090513377:orders-notifications-dev\" WsEndpoint=\"https://6zvolh5t5b.execute-api.us-east-1.amazonaws.com/prod\" WsConnectionsTableName=\"ConnectionTable-dev\" OrderTableName=\"OrderTable-dev\" PinpointAppId=\"\" PinpointFromNumber=\"\""
+image_repositories = []
+stack_name = "notifications-lambda-dev"
 
 [default.package.parameters]
 resolve_s3 = true

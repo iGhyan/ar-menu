@@ -1,39 +1,124 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
+Description: ar-assets-lambda — AR asset CRUD with Cognito JWT auth + RBAC
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────────────────────────────────────
 
 Parameters:
-  BucketAr:
+
+  AssetBucketName:
     Type: String
+    Description: S3 bucket name for AR .glb models
+
   CfDomain:
     Type: String
+    Description: CloudFront distribution domain (e.g. d1234abcd.cloudfront.net)
+
   TableMenu:
     Type: String
+    Description: DynamoDB table name for menu data
+
+  SharedLayerArn:
+    Type: String
+    Description: >
+      ARN of the shared Lambda Layer (exported from glb-validator stack).
+      Example: arn:aws:lambda:ap-south-1:123456789012:layer:glb-validator-shared-dev:1
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+  CognitoRegion:
+    Type: String
+    Default: ap-south-1
+
+  CognitoUserPoolId:
+    Type: String
+    Default: ap-south-1_SCyQ50etN
+
+  CognitoClientId:
+    Type: String
+    Default: 7903hkujl9qeq67toemi5qrhes
+    NoEcho: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────────────────────────────────────
 
 Globals:
   Function:
-    Runtime: python3.14
+    Runtime: python3.13
     MemorySize: 512
     Timeout: 10
+    Layers:
+      - !Ref SharedLayerArn
+    Environment:
+      Variables:
+        ASSET_BUCKET_NAME:    !Ref AssetBucketName
+        CF_DOMAIN:            !Ref CfDomain
+        TABLE_MENU:           !Ref TableMenu
+        ENVIRONMENT:          !Ref Environment
+        LOG_LEVEL:            !Ref LogLevel
+        COGNITO_REGION:       !Ref CognitoRegion
+        COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+        COGNITO_CLIENT_ID:    !Ref CognitoClientId
+
   Api:
     Cors:
       AllowMethods: "'GET,PUT,DELETE,OPTIONS'"
       AllowHeaders: "'Content-Type,X-Tenant-Id,Authorization'"
-      AllowOrigin: "'*'"
+      AllowOrigin:  "'*'"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
 
 Resources:
+
+  # ── Lambda Function ─────────────────────────────────────────────────────────
+
   ArAssetsFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: ar-assets-lambda
+      FunctionName: !Sub "ar-assets-lambda-${Environment}"
       Handler: handler.lambda_handler
-      CodeUri: .
-      Environment:
-        Variables:
-          BUCKET_AR: !Ref BucketAr
-          CF_DOMAIN:  !Ref CfDomain
-          TABLE_MENU: !Ref TableMenu
+      CodeUri: ./
+      Description: >
+        GET/PUT/DELETE AR asset metadata. GET is public (guest AR view);
+        PUT/DELETE require Cognito JWT with admin or tenant role.
+
       Policies:
-        - !Ref ArAssetsPolicy
+        - Statement:
+
+            # S3: generate presigned URLs for GET
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${AssetBucketName}/*"
+
+            # CloudFront: invalidate cache on DELETE
+            - Effect: Allow
+              Action:
+                - cloudfront:CreateInvalidation
+                - cloudfront:ListDistributions
+              Resource: "*"
+
+            # DynamoDB: read + update item AR metadata
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableMenu}"
+
       Events:
         GetAr:
           Type: Api
@@ -56,36 +141,57 @@ Resources:
             Path: /ar/{restaurantId}/{itemId}
             Method: OPTIONS
 
-  ArAssetsPolicy:
-    Type: AWS::IAM::ManagedPolicy
+  # ── CloudWatch Log Group ────────────────────────────────────────────────────
+
+  ArAssetsLogGroup:
+    Type: AWS::Logs::LogGroup
     Properties:
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: S3PresignedGet
-            Effect: Allow
-            Action:
-              - s3:GetObject
-            Resource: !Sub "arn:aws:s3:::${BucketAr}/*"
+      LogGroupName: !Sub "/aws/lambda/ar-assets-lambda-${Environment}"
+      RetentionInDays: 30
 
-          - Sid: CloudFrontInvalidate
-            Effect: Allow
-            Action:
-              - cloudfront:CreateInvalidation
-              - cloudfront:ListDistributions
-            Resource: "*"
+  # ── CloudWatch Metric Filter: auth failures ─────────────────────────────────
 
-          - Sid: DynamoMenuTable
-            Effect: Allow
-            Action:
-              - dynamodb:GetItem
-              - dynamodb:UpdateItem
-            Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableMenu}"
+  AuthFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ArAssetsLogGroup
+      FilterPattern: '{ $.event = "handler.auth.failed" }'
+      MetricTransformations:
+        - MetricName: AuthFailures
+          MetricNamespace: !Sub "ArAssets/${Environment}"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  # ── CloudWatch Alarm: spike in auth failures ────────────────────────────────
+
+  AuthFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "ar-assets-auth-failure-spike-${Environment}"
+      AlarmDescription: >
+        More than 20 auth failures in 5 minutes — possible token brute-force.
+      Namespace:          !Sub "ArAssets/${Environment}"
+      MetricName:         AuthFailures
+      Statistic:          Sum
+      Period:             300
+      EvaluationPeriods:  1
+      Threshold:          20
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData:   notBreaching
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────────────────────
 
 Outputs:
+
   ArAssetsApiUrl:
     Description: AR Assets API base URL
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/ar/{restaurantId}/{itemId}"
+    Value: !Sub >
+      https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/ar/{restaurantId}/{itemId}
+
   ArAssetsFunctionArn:
     Description: Lambda function ARN
     Value: !GetAtt ArAssetsFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-FunctionArn"

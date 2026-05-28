@@ -2,18 +2,13 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: glb-validator-lambda – validates .glb assets uploaded to S3
 
-Globals:
-  Function:
-    Runtime: python3.13
-    MemorySize: 1024
-    Timeout: 60
-    Environment:
-      Variables:
-        BUCKET_AR: !Ref BucketAR
-        SNS_ADMIN: !Ref SNSAdminArn
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────────────────────────────────────
 
 Parameters:
-  BucketAR:
+
+  AssetBucketName:
     Type: String
     Default: menu-assets-dev-833090513377
     Description: Name of the existing S3 bucket that holds AR assets
@@ -22,47 +17,181 @@ Parameters:
     Type: String
     Description: ARN of the SNS topic used to notify admins of rejected assets
 
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: Lambda log level
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────────────────────────────────────
+
+Globals:
+  Function:
+    Runtime: python3.13
+    MemorySize: 1024
+    Timeout: 60
+    Layers:
+      - !Ref SharedLayer
+    Environment:
+      Variables:
+        # Standardised env var names (old: BUCKET_AR → new: ASSET_BUCKET_NAME)
+        ASSET_BUCKET_NAME: !Ref AssetBucketName
+        SNS_ADMIN_ARN:     !Ref SNSAdminArn
+        ENVIRONMENT:       !Ref Environment
+        LOG_LEVEL:         !Ref LogLevel
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
+
 Resources:
 
-  # Lambda Function
+  # ── Lambda Layer (shared utilities) ────────────────────────────────────────
+
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "glb-validator-shared-${Environment}"
+      Description: >
+        Shared library layer: AWS client factory, structured logger,
+        error handler, request parser, response builder, tenant validator.
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.13
+        - python3.12
+        - python3.11
+      RetentionPolicy: Delete   # Use Retain in prod to protect existing Lambdas
+    Metadata:
+      BuildMethod: python3.13   # SAM builds the layer's requirements.txt
+
+  # ── Lambda Function ─────────────────────────────────────────────────────────
+
   GlbValidatorFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: glb-validator-lambda
+      FunctionName: !Sub "glb-validator-lambda-${Environment}"
       CodeUri: ./
       Handler: lambda_function.lambda_handler
-      Description: Validates .glb files uploaded to S3 and routes them to approved/ or rejected/
+      Description: >
+        Validates .glb files uploaded to S3 and routes them to
+        approved/ or rejected/. Notifies admin via SNS on rejection.
 
       Policies:
         - Statement:
+
+            # S3: read source, write destination, delete source
             - Effect: Allow
               Action:
                 - s3:GetObject
                 - s3:PutObject
                 - s3:DeleteObject
+                - s3:HeadObject
               Resource:
-                - !Sub "arn:aws:s3:::${BucketAR}"
-                - !Sub "arn:aws:s3:::${BucketAR}/*"
+                - !Sub "arn:aws:s3:::${AssetBucketName}/*"
 
+            # S3 bucket-level (for ListBucket if needed)
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource:
+                - !Sub "arn:aws:s3:::${AssetBucketName}"
+
+            # SNS: publish rejection alerts
             - Effect: Allow
               Action:
                 - sns:Publish
               Resource: !Ref SNSAdminArn
 
-  # Lambda permission for S3 to invoke it
+  # ── Lambda Permission (allows S3 to invoke the function) ───────────────────
+
   GlbValidatorS3Permission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !GetAtt GlbValidatorFunction.Arn
       Action: lambda:InvokeFunction
       Principal: s3.amazonaws.com
-      SourceArn: !Sub "arn:aws:s3:::${BucketAR}"
+      SourceArn: !Sub "arn:aws:s3:::${AssetBucketName}"
+
+  # ── CloudWatch Log Group ────────────────────────────────────────────────────
+
+  GlbValidatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/glb-validator-lambda-${Environment}"
+      RetentionInDays: 30
+
+  # ── CloudWatch Metric Filters (JSON structured logs) ───────────────────────
+
+  RejectionMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref GlbValidatorLogGroup
+      FilterPattern: '{ $.event = "file.rejected" }'
+      MetricTransformations:
+        - MetricName: GlbFilesRejected
+          MetricNamespace: !Sub "GLBValidator/${Environment}"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  StorageErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref GlbValidatorLogGroup
+      FilterPattern: '{ $.event = "storage.error" }'
+      MetricTransformations:
+        - MetricName: StorageErrors
+          MetricNamespace: !Sub "GLBValidator/${Environment}"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  # ── CloudWatch Alarm: high rejection rate ──────────────────────────────────
+
+  HighRejectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "glb-validator-high-rejection-${Environment}"
+      AlarmDescription: >
+        More than 10 GLB files rejected in a 5-minute window —
+        may indicate a client-side upload bug or attack.
+      Namespace:          !Sub "GLBValidator/${Environment}"
+      MetricName:         GlbFilesRejected
+      Statistic:          Sum
+      Period:             300     # 5 minutes
+      EvaluationPeriods:  1
+      Threshold:          10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData:   notBreaching
+      AlarmActions:
+        - !Ref SNSAdminArn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────────────────────
 
 Outputs:
+
   GlbValidatorFunctionArn:
     Description: ARN of the glb-validator-lambda
     Value: !GetAtt GlbValidatorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-FunctionArn"
 
-  ARBucketName:
+  SharedLayerArn:
+    Description: ARN of the shared Lambda Layer
+    Value: !Ref SharedLayer
+    Export:
+      Name: !Sub "${AWS::StackName}-SharedLayerArn"
+
+  AssetBucketName:
     Description: S3 bucket used for AR assets
-    Value: !Ref BucketAR
+    Value: !Ref AssetBucketName
+    Export:
+      Name: !Sub "${AWS::StackName}-AssetBucketName"

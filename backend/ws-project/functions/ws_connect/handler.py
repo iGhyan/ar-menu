@@ -1,173 +1,134 @@
 """
+functions/ws_connect/handler.py
+================================
 ws-connect-lambda
 Trigger  : API Gateway WebSocket $connect
-Memory   : 256 MB  |  Timeout : 5s
-Env Vars : REDIS_URL, TABLE_CONN
+Memory   : 256 MB  |  Timeout: 5s
 
-Auth: Cognito JWT (RS256) — replaces old HS256 JWT_SECRET approach
-Any logged-in user can connect (admin, tenant, kitchen_staff)
+Auth: Cognito JWT — any logged-in user can connect
+      (menulay_admin, menulay_tenant, menulay_kitchen_staff)
+
+Flow
+----
+1. Extract token from Authorization header or ?token= query param
+2. Verify Cognito JWT (expiry, issuer, client_id, token_use)
+3. Store connection record in DynamoDB (TTL = 1 hour)
+4. Cache connectionId → userId in Redis hash (optional, best-effort)
+
+Env vars
+--------
+  REDIS_URL   — Redis connection URL (required)
+  TABLE_CONN  — DynamoDB connection table name (required)
+  COGNITO_REGION       — defaults to ap-south-1
+  COGNITO_USER_POOL_ID — Cognito User Pool ID
+  COGNITO_CLIENT_ID    — Cognito App Client ID
 """
 
+from __future__ import annotations
+
 import os
+import sys
 import time
-import json
-import base64
-import logging
-import urllib.request
-from typing import Optional, Dict, Any
+
+# ── Layer path setup (for local/SAM invocation) ───────────────────────────────
+sys.path.insert(0, "/opt/python")
 
 import boto3
-import redis
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+from shared.aws_clients import get_dynamodb_resource
+from shared.cognito_auth import CognitoAuth
+from shared.exceptions import TokenMissingError, AuthError
+from shared.structured_logger import get_logger, bind_lambda_context
 
-REDIS_URL  = os.environ["REDIS_URL"]
-TABLE_CONN = os.environ["TABLE_CONN"]
+# ── Config ────────────────────────────────────────────────────────────────────
+_TABLE_CONN = os.environ["TABLE_CONN"]
+_REDIS_URL  = os.environ["REDIS_URL"]
 
-# ── Cognito config ─────────────────────────────────────────────────────────────
-REGION       = 'ap-south-1'
-USER_POOL_ID = 'ap-south-1_SCyQ50etN'
-CLIENT_ID    = '7903hkujl9qeq67toemi5qrhes'
+_log  = get_logger("ws-connect")
+_auth = CognitoAuth()
 
-JWKS_URL = (
-    f'https://cognito-idp.{REGION}.amazonaws.com/'
-    f'{USER_POOL_ID}/.well-known/jwks.json'
-)
+# ── DynamoDB ──────────────────────────────────────────────────────────────────
+_table = get_dynamodb_resource().Table(_TABLE_CONN)
 
-# ── AWS clients ────────────────────────────────────────────────────────────────
-dynamodb = boto3.resource("dynamodb")
-table    = dynamodb.Table(TABLE_CONN)
-
-# ── Redis optional ─────────────────────────────────────────────────────────────
+# ── Redis (optional) ──────────────────────────────────────────────────────────
 try:
-    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
-    redis_client.ping()
-    REDIS_AVAILABLE = True
-    logger.info("Redis connected")
-except Exception as e:
-    logger.warning("Redis not available, skipping (non-critical): %s", e)
-    redis_client = None
-    REDIS_AVAILABLE = False
-
-# ── JWKS cache ─────────────────────────────────────────────────────────────────
-_jwks_cache: Optional[Dict] = None
-_jwks_cache_time: float = 0
-JWKS_CACHE_TTL = 3600
+    import redis as _redis_lib
+    _redis_client = _redis_lib.Redis.from_url(
+        _REDIS_URL, decode_responses=True, socket_timeout=2
+    )
+    _redis_client.ping()
+    _REDIS_OK = True
+    _log.info("redis.connected")
+except Exception as exc:
+    _log.warning("redis.unavailable", cause=str(exc))
+    _redis_client = None
+    _REDIS_OK     = False
 
 
-def _get_jwks() -> Dict:
-    global _jwks_cache, _jwks_cache_time
-    now = time.time()
-    if _jwks_cache and (now - _jwks_cache_time) < JWKS_CACHE_TTL:
-        return _jwks_cache
-    with urllib.request.urlopen(JWKS_URL, timeout=5) as res:
-        _jwks_cache = json.loads(res.read())
-        _jwks_cache_time = now
-        logger.info("JWKS refreshed")
-    return _jwks_cache
-
-
-def _decode_payload(token: str) -> Dict:
-    """Base64 decode JWT payload — for claims only."""
-    parts = token.split('.')
-    if len(parts) != 3:
-        raise ValueError('Invalid JWT format')
-    payload = parts[1]
-    payload += '=' * (4 - len(payload) % 4)
-    return json.loads(base64.urlsafe_b64decode(payload))
-
-
-def _verify_cognito_token(token: str) -> Dict[str, Any]:
-    """
-    Verify Cognito JWT token.
-    Returns claims dict if valid, raises ValueError if not.
-    """
-    if token.startswith('Bearer '):
-        token = token[7:]
-
-    claims = _decode_payload(token)
-
-    # Check expiry
-    if claims.get('exp', 0) < time.time():
-        raise ValueError('Token has expired')
-
-    # Check issuer
-    expected_iss = f'https://cognito-idp.{REGION}.amazonaws.com/{USER_POOL_ID}'
-    if claims.get('iss') != expected_iss:
-        raise ValueError('Invalid token issuer')
-
-    # Check client
-    token_client = claims.get('client_id') or claims.get('aud')
-    if token_client != CLIENT_ID:
-        raise ValueError('Invalid token client')
-
-    # Check token_use
-    if claims.get('token_use') not in ('id', 'access'):
-        raise ValueError('Invalid token_use')
-
-    return claims
-
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def lambda_handler(event: dict, context) -> dict:
+    bind_lambda_context(context)
+
     request_ctx   = event.get("requestContext", {})
     connection_id = request_ctx.get("connectionId", "")
-    headers       = event.get("headers") or {}
 
-    # ── 1. Token extract ──────────────────────────────────────────────────────
-    # WebSocket connect mein token query string ya header se aata hai
+    # ── 1. Extract token ──────────────────────────────────────────────────────
+    headers      = event.get("headers") or {}
     query_params = event.get("queryStringParameters") or {}
-    auth_header  = (
-        headers.get("Authorization") or
-        headers.get("authorization") or
-        query_params.get("token") or  # ws://url?token=xxx
-        ""
-    )
-    token = auth_header.replace("Bearer ", "").strip()
 
-    if not token:
-        logger.info("No token — rejecting $connect for %s", connection_id)
+    raw_token = (
+        headers.get("Authorization")
+        or headers.get("authorization")
+        or query_params.get("token")
+        or ""
+    ).strip()
+
+    if not raw_token:
+        _log.info("connect.rejected.no_token", connection_id=connection_id)
         return {"statusCode": 401, "body": "Unauthorized: missing token"}
 
-    # ── 2. Cognito JWT verify ─────────────────────────────────────────────────
+    # ── 2. Verify JWT ─────────────────────────────────────────────────────────
     try:
-        claims = _verify_cognito_token(token)
-    except ValueError as e:
-        logger.warning("Invalid JWT — rejecting $connect for %s: %s", connection_id, str(e))
-        return {"statusCode": 401, "body": f"Unauthorized: {str(e)}"}
-    except Exception as e:
-        logger.error("JWT verify error for %s: %s", connection_id, str(e))
+        user = _auth.get_user_from_event({
+            "headers": {"Authorization": raw_token}
+        })
+    except AuthError as exc:
+        _log.warning(
+            "connect.rejected.invalid_token",
+            connection_id=connection_id,
+            error_code=exc.error_code,
+            reason=exc.message,
+        )
+        return {"statusCode": 401, "body": f"Unauthorized: {exc.message}"}
+    except Exception as exc:  # noqa: BLE001
+        _log.error("connect.jwt_error", connection_id=connection_id, exc_message=str(exc))
         return {"statusCode": 401, "body": "Unauthorized: token verification failed"}
 
-    user_id   = claims.get("sub", "unknown")
-    email     = claims.get("email", "")
-    tenant_id = claims.get("custom:tenant_id", "")
-    groups    = claims.get("cognito:groups", [])
-
-    logger.info(
-        "JWT valid — connectionId=%s userId=%s email=%s groups=%s",
-        connection_id, user_id, email, groups
-    )
-
-    # ── 3. DynamoDB — store connection ────────────────────────────────────────
+    # ── 3. Store in DynamoDB ──────────────────────────────────────────────────
     ttl = int(time.time()) + 3600
-    table.put_item(Item={
+    _table.put_item(Item={
         "connectionId": connection_id,
-        "userId":       user_id,
-        "email":        email,
-        "tenantId":     tenant_id,
-        "groups":       groups,
+        "userId":       user.sub,
+        "email":        user.email,
+        "tenantId":     user.tenant_id,
+        "groups":       user.groups,
         "connectedAt":  int(time.time()),
         "ttl":          ttl,
     })
 
-    # ── 4. Redis HSET — optional ──────────────────────────────────────────────
-    if REDIS_AVAILABLE and redis_client:
+    # ── 4. Cache in Redis (best-effort) ───────────────────────────────────────
+    if _REDIS_OK and _redis_client:
         try:
-            redis_client.hset("connections", connection_id, user_id)
-        except Exception as e:
-            logger.warning("Redis HSET failed (non-critical): %s", e)
+            _redis_client.hset("connections", connection_id, user.sub)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("redis.hset.failed", connection_id=connection_id, exc_message=str(exc))
 
-    logger.info("Connected: connectionId=%s userId=%s tenantId=%s",
-                connection_id, user_id, tenant_id)
+    _log.info(
+        "ws.connected",
+        connection_id=connection_id,
+        user_id=user.sub,
+        tenant_id=user.tenant_id,
+        groups=user.groups,
+    )
     return {"statusCode": 200, "body": "Connected"}
