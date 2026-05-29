@@ -38,6 +38,7 @@ os.environ.update({
     "AWS_DEFAULT_REGION":    "us-east-1",
     "AWS_ACCESS_KEY_ID":     "testing",
     "AWS_SECRET_ACCESS_KEY": "testing",
+    "TABLE_RESTAURANT_TABLES": "RestaurantTables-test",
     "COGNITO_REGION":        "ap-south-1",
     "COGNITO_USER_POOL_ID":  "ap-south-1_SCyQ50etN",
     "COGNITO_CLIENT_ID":     "7903hkujl9qeq67toemi5qrhes",

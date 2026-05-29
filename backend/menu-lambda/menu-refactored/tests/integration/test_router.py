@@ -394,3 +394,84 @@ class TestAuthRbac:
         resp = _invoke(event, mock_restaurant_svc=mock_svc)
         # GET is public — no 401 from router
         assert resp["statusCode"] == 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TABLE routes
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTableRoutes:
+    def test_get_tables_public_returns_200(self):
+        """GET tables is public — no auth needed."""
+        mock_table_ddb = MagicMock()
+        mock_table_ddb.query.return_value = {"Items": []}
+
+        with patch("handlers.table_handler._table", mock_table_ddb):
+            event = api_event(
+                "GET",
+                f"/menus/restaurants/{RESTAURANT_ID}/tables",
+                path_params={"restaurantId": RESTAURANT_ID},
+                tenant_id=TENANT_ID,
+            )
+            resp = _invoke(event)
+
+        assert resp["statusCode"] == 200
+
+    def test_post_table_requires_auth(self):
+        event = api_event(
+            "POST",
+            f"/menus/restaurants/{RESTAURANT_ID}/tables",
+            body={"tableNumber": "T-01", "zone": "Main"},
+            path_params={"restaurantId": RESTAURANT_ID},
+            tenant_id=TENANT_ID,
+        )
+        resp = _invoke(event)
+        assert resp["statusCode"] == 401
+
+    def test_post_table_with_admin_token_returns_201(self):
+        mock_table_ddb = MagicMock()
+        mock_table_ddb.put_item.return_value = {}
+
+        with patch("handlers.table_handler._table", mock_table_ddb), \
+             patch("handlers.table_handler.new_id", return_value="new-uuid"), \
+             patch("handlers.table_handler.utc_now", return_value="2026-05-01T00:00:00Z"):
+            token = make_jwt(groups=["menulay_admin"], tenant_id=TENANT_ID)
+            event = api_event(
+                "POST",
+                f"/menus/restaurants/{RESTAURANT_ID}/tables",
+                body={"tableNumber": "T-01", "zone": "Main Hall", "capacity": 4},
+                token=token,
+                path_params={"restaurantId": RESTAURANT_ID},
+            )
+            resp = _invoke(event)
+
+        assert resp["statusCode"] == 201
+
+    def test_delete_table_with_auth_returns_200(self):
+        TABLE_ID = "tbl-uuid-1"
+        mock_table_ddb = MagicMock()
+        mock_table_ddb.delete_item.return_value = {}
+
+        with patch("handlers.table_handler._table", mock_table_ddb):
+            token = make_jwt(groups=["menulay_admin"], tenant_id=TENANT_ID)
+            event = api_event(
+                "DELETE",
+                f"/menus/restaurants/{RESTAURANT_ID}/tables/{TABLE_ID}",
+                token=token, tenant_id=TENANT_ID,
+                path_params={"restaurantId": RESTAURANT_ID, "tableId": TABLE_ID},
+            )
+            resp = _invoke(event)
+
+        assert resp["statusCode"] == 200
+
+    def test_put_table_kitchen_staff_forbidden(self):
+        TABLE_ID = "tbl-uuid-1"
+        token = make_jwt(groups=["menulay_kitchen_staff"], tenant_id=TENANT_ID)
+        event = api_event(
+            "PUT",
+            f"/menus/restaurants/{RESTAURANT_ID}/tables/{TABLE_ID}",
+            body={"capacity": 6}, token=token,
+            path_params={"restaurantId": RESTAURANT_ID, "tableId": TABLE_ID},
+        )
+        resp = _invoke(event)
+        assert resp["statusCode"] == 403

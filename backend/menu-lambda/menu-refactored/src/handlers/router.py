@@ -5,6 +5,7 @@ RBAC:
   GET  /menus/...  → Public (guests read menu)
   POST/PUT/DELETE  → Admin or Tenant only
   upload/presigned → Admin or Tenant only
+  tables           → GET public, POST/PUT/DELETE admin/tenant
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from handlers.request import parse_event
 from handlers.restaurant_handler import handle_restaurant
 from handlers.category_handler import handle_category
 from handlers.item_handler import handle_menu_item
+from handlers.table_handler import handle_table
 from handlers.presigned_handler import handle_presigned_url
 from handlers.upload_handler import handle_upload
 from services.cache_service import CacheService
@@ -26,7 +28,6 @@ from repository.s3 import S3Repository
 from utils.logger import get_logger
 from utils.response import bad_request, internal_error
 
-# ── NEW: Cognito auth ─────────────────────────────────────────────────────────
 from cognito_auth import (
     get_user_from_event,
     is_admin_or_tenant,
@@ -37,20 +38,23 @@ from cognito_auth import (
 log = get_logger(__name__)
 
 _ROUTES: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"^/menus/presigned-url$"),                                        "presigned"),
-    (re.compile(r"^/menus/upload/restaurants/[^/]+/logo$"),                        "upload"),
-    (re.compile(r"^/menus/upload/restaurants/[^/]+/categories/[^/]+/image$"),      "upload"),
-    (re.compile(r"^/menus/upload/restaurants/[^/]+/items/[^/]+/image$"),           "upload"),
-    (re.compile(r"^/menus/upload/restaurants/[^/]+/items/[^/]+/ar-model$"),        "upload"),
-    (re.compile(r"^/menus/restaurants/[^/]+/categories/[^/]+$"),                   "category"),
-    (re.compile(r"^/menus/restaurants/[^/]+/categories$"),                         "category"),
-    (re.compile(r"^/menus/restaurants/[^/]+/items/[^/]+$"),                        "item"),
-    (re.compile(r"^/menus/restaurants/[^/]+/items$"),                              "item"),
-    (re.compile(r"^/menus/restaurants/[^/]+$"),                                    "restaurant"),
-    (re.compile(r"^/menus/restaurants$"),                                          "restaurant"),
+    (re.compile(r"^/menus/presigned-url$"),                                             "presigned"),
+    (re.compile(r"^/menus/upload/restaurants/[^/]+/logo$"),                             "upload"),
+    (re.compile(r"^/menus/upload/restaurants/[^/]+/categories/[^/]+/image$"),           "upload"),
+    (re.compile(r"^/menus/upload/restaurants/[^/]+/items/[^/]+/image$"),                "upload"),
+    (re.compile(r"^/menus/upload/restaurants/[^/]+/items/[^/]+/ar-model$"),             "upload"),
+    # ── Table routes (before restaurant to avoid conflict) ────────────────────
+    (re.compile(r"^/menus/restaurants/[^/]+/tables/[^/]+$"),                            "table"),
+    (re.compile(r"^/menus/restaurants/[^/]+/tables$"),                                  "table"),
+    # ── Other routes ──────────────────────────────────────────────────────────
+    (re.compile(r"^/menus/restaurants/[^/]+/categories/[^/]+$"),                        "category"),
+    (re.compile(r"^/menus/restaurants/[^/]+/categories$"),                              "category"),
+    (re.compile(r"^/menus/restaurants/[^/]+/items/[^/]+$"),                             "item"),
+    (re.compile(r"^/menus/restaurants/[^/]+/items$"),                                   "item"),
+    (re.compile(r"^/menus/restaurants/[^/]+$"),                                         "restaurant"),
+    (re.compile(r"^/menus/restaurants$"),                                               "restaurant"),
 ]
 
-# ── Singletons ────────────────────────────────────────────────────────────────
 _cache:          CacheService | None = None
 _restaurant_svc: RestaurantService | None = None
 _category_svc:   CategoryService | None = None
@@ -61,20 +65,12 @@ _s3_repo:        S3Repository | None = None
 
 def _get_services():
     global _cache, _restaurant_svc, _category_svc, _item_svc, _s3_svc, _s3_repo
-
-    if _cache is None:
-        _cache = CacheService()
-    if _s3_svc is None:
-        _s3_svc = S3Service()
-    if _s3_repo is None:
-        _s3_repo = S3Repository()
-    if _restaurant_svc is None:
-        _restaurant_svc = RestaurantService(cache=_cache, s3_svc=_s3_svc)
-    if _category_svc is None:
-        _category_svc = CategoryService(cache=_cache, s3_svc=_s3_svc)
-    if _item_svc is None:
-        _item_svc = MenuItemService(cache=_cache, s3_svc=_s3_svc)
-
+    if _cache is None:          _cache          = CacheService()
+    if _s3_svc is None:         _s3_svc         = S3Service()
+    if _s3_repo is None:        _s3_repo        = S3Repository()
+    if _restaurant_svc is None: _restaurant_svc = RestaurantService(cache=_cache, s3_svc=_s3_svc)
+    if _category_svc is None:   _category_svc   = CategoryService(cache=_cache, s3_svc=_s3_svc)
+    if _item_svc is None:       _item_svc       = MenuItemService(cache=_cache, s3_svc=_s3_svc)
     return _restaurant_svc, _category_svc, _item_svc, _s3_svc, _s3_repo
 
 
@@ -84,6 +80,10 @@ def _extract_path_params(path: str) -> dict[str, str]:
         re.compile(r"^/menus/upload/restaurants/(?P<restaurantId>[^/]+)/items/(?P<itemId>[^/]+)/image$"),
         re.compile(r"^/menus/upload/restaurants/(?P<restaurantId>[^/]+)/items/(?P<itemId>[^/]+)/ar-model$"),
         re.compile(r"^/menus/upload/restaurants/(?P<restaurantId>[^/]+)/logo$"),
+        # ── Table params ──────────────────────────────────────────────────────
+        re.compile(r"^/menus/restaurants/(?P<restaurantId>[^/]+)/tables/(?P<tableId>[^/]+)$"),
+        re.compile(r"^/menus/restaurants/(?P<restaurantId>[^/]+)/tables$"),
+        # ── Other params ──────────────────────────────────────────────────────
         re.compile(r"^/menus/restaurants/(?P<restaurantId>[^/]+)/categories/(?P<categoryId>[^/]+)$"),
         re.compile(r"^/menus/restaurants/(?P<restaurantId>[^/]+)/categories$"),
         re.compile(r"^/menus/restaurants/(?P<restaurantId>[^/]+)/items/(?P<itemId>[^/]+)$"),
@@ -97,10 +97,7 @@ def _extract_path_params(path: str) -> dict[str, str]:
     return {}
 
 
-# ── Write routes that require auth ────────────────────────────────────────────
-_WRITE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
-
-# These route keys always require auth regardless of method
+_WRITE_METHODS        = {"POST", "PUT", "DELETE", "PATCH"}
 _AUTH_REQUIRED_ROUTES = {"presigned", "upload"}
 
 
@@ -125,7 +122,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             return bad_request(f"Unknown route: {ctx.path}")
 
         # ── Auth check ────────────────────────────────────────────────────────
-        # Require auth for: all write methods + upload + presigned
         needs_auth = (
             ctx.method in _WRITE_METHODS or
             route_key in _AUTH_REQUIRED_ROUTES
@@ -141,11 +137,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 log.error("Auth error: %s", str(e))
                 return r_unauthorized("Invalid or expired token")
 
-            # RBAC: only admin or tenant
             if not is_admin_or_tenant(user):
                 return r_forbidden("Only admin or tenant can modify menu")
 
-            # Tenant isolation: override tenant_id from JWT
             jwt_tenant = user.get("tenant_id")
             if jwt_tenant:
                 ctx.tenant_id = jwt_tenant
@@ -154,16 +148,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         # ── Route to handler ─────────────────────────────────────────────────
         restaurant_svc, category_svc, item_svc, s3_svc, s3_repo = _get_services()
 
-        if route_key == "presigned":
-            return handle_presigned_url(ctx, s3_svc)
-        if route_key == "upload":
-            return handle_upload(ctx, s3_repo, event)
-        if route_key == "restaurant":
-            return handle_restaurant(ctx, restaurant_svc, s3_repo)
-        if route_key == "category":
-            return handle_category(ctx, category_svc, s3_repo)
-        if route_key == "item":
-            return handle_menu_item(ctx, item_svc, s3_repo)
+        if route_key == "presigned":  return handle_presigned_url(ctx, s3_svc)
+        if route_key == "upload":     return handle_upload(ctx, s3_repo, event)
+        if route_key == "restaurant": return handle_restaurant(ctx, restaurant_svc, s3_repo)
+        if route_key == "category":   return handle_category(ctx, category_svc, s3_repo)
+        if route_key == "item":       return handle_menu_item(ctx, item_svc, s3_repo)
+        if route_key == "table":      return handle_table(ctx)
 
         return bad_request(f"Unknown route: {ctx.path}")
 
